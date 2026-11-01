@@ -18,7 +18,7 @@ A 35-billion-parameter model, ~1.9x faster than tuned llama.cpp and ik_llama.cpp
 
 </div>
 
-## This fork (moe-checkpoint): what changed
+## Prompt checkpoints, FlashAttention prefill and TurboQuant KV
 
 Four changes on top of moex v0.2.0 (`8148499`), measured on an RTX 5050 Laptop 8 GB, Core 7 240H, 32 GB RAM, with
 Qwen3.6-35B-A3B **UD-Q4_K_XL** imported via `moex import`. They are mainly for long prompts and agent use, where a
@@ -29,11 +29,18 @@ client resends a slightly different history every turn.
 | **Prompt checkpoints** (`src/session.h`, `src/moex.cu`) | The DeltaNet state can't be rewound, so a changed history (a client re-tokenizing a reply, an edited message, a regenerate) used to re-read the whole prompt. A checkpoint is a host-RAM copy of that state (63 MB). One is saved every `MOEX_CKPT_EVERY` prompt tokens (default 8192), plus one where the reply's turn starts (the last `<\|im_start\|>`) when the turn added 256+ tokens. On a mismatch, the latest checkpoint inside the unchanged prefix is restored. K/V rows need no copy. `MOEX_CKPT=N` keeps N (default 4, 0 = off). | 21.8k-token chat. Edited history: **18.7 s → 0.63 s** to first token (re-reads 77 tokens). Regenerate: **18.6 s → 0.28 s**. A turn adding 256+ tokens pays ~0.14 s more to first token for its checkpoint; shorter turns (and `moex bench`) are unchanged. |
 | **FlashAttention-2 prefill kernel** (`attn_fa_k` in `src/kernels.cuh`) | `mma.sync` m16n8k16 kernel. Each K/V tile of 64 keys is shared by 16 tokens × 8 query heads, instead of 4 tokens in `attn_prefill_k`. K/V stay int8 in shared memory and are widened to fp16 in registers. S and O live in registers. Checked against an fp64 reference in `tests/test_fa.cu`. `MOEX_FA=0` = the old kernel (int8 KV only, see below). **Needs compute capability 8.0+ (RTX 30 / 40 / 50)**: on RTX 20 moex keeps `attn_prefill_k`. | Attention **2.4–2.5× faster** (6.7 → ~16 TFLOPS) at 0–260k context on the RTX 5050 (sm_120); 2.8–3× on an RTX 4050 (sm_89), measured by the upstream maintainer. 252k-token prompt: **~21 min → ~9 min**. |
 | **Prefill chunk 1024 → 2048** (`MOEX_CH`, compile time) | Each expert streamed over PCIe during a prompt serves 2× more tokens. | 21.8k-token prompt: **26.4 s → 19.8 s (~1,100 tok/s)**, with FlashAttention. 4096 measured slower. |
-| **TurboQuant KV cache** (`MOEX_KV=turbo`) | K 4-bit / V 3-bit, as llama.cpp's turbo4 / turbo3. Each 128-value half-row is rotated with a sign-randomized Walsh-Hadamard transform and quantized to Lloyd-Max centroids. Queries get the same rotation, and the output is rotated back before the gate. 240 bytes per (kv head, position) instead of 520. The freed VRAM becomes expert slots automatically. | KV **−54%**. At 262k context: expert slots **1,060 → 1,939 (+83%)**, decode 53/54 → 57/62 tok/s. At 90k: +14% slots, decode unchanged within noise. Mean KL on `--check`: 1.87e-2 → 1.98e-2. |
+| **TurboQuant KV cache** (`MOEX_KV=turbo`, **opt-in, experimental**) | K 4-bit / V 3-bit, as llama.cpp's turbo4 / turbo3. Each 128-value half-row is rotated with a sign-randomized Walsh-Hadamard transform and quantized to Lloyd-Max centroids. Queries get the same rotation, and the output is rotated back before the gate. 240 bytes per (kv head, position) instead of 520. The freed VRAM becomes expert slots automatically. | KV **−54%**. At 262k context: expert slots **1,060 → 1,939 (+83%)**, decode 53/54 → 57/62 tok/s. At 90k: +14% slots, decode unchanged within noise. **Costs accuracy:** `--check` mean KL 3.58e-3 → 1.15e-2 and top-1 100% → 97.2% (2 mismatches) on an RTX 4050; 1.87e-2 → 1.98e-2 on the RTX 5050. See below. |
 
 Decode with a 21.8k-token prompt is ~57–62 tok/s, vs ~47–49 for the best tuned llama.cpp setup on the same machine.
 
 Worth knowing:
+- **Turbo KV is experimental; int8 stays the default.** Its accuracy cost depends on the machine: on an RTX 4050,
+  `--check` gave a mean KL of 1.15e-2 against 3.58e-3 for int8 (about 3×), and top-1 agreement fell from 100% to 97.2%
+  (2 mismatches). On the RTX 5050 the same check moved only from 1.87e-2 to 1.98e-2. `--check` uses a short prompt:
+  **quality at long context is not validated yet**, though long context is the reason to turn turbo on.
+- **Checkpoints use host RAM, not VRAM:** about 63 MB each (the DeltaNet state), 4 by default, plus one spare buffer
+  that an evicted checkpoint leaves for the next save, so up to ~315 MB. They are allocated as they are saved.
+  `MOEX_CKPT=N` sets how many are kept; `MOEX_CKPT=0` turns them off and allocates nothing.
 - **FlashAttention needs sm_80+.** The release fatbin still targets RTX 20 (sm_75): there `fa_mma` compiles to a trap that
   is never reached. `fa_supported()` checks the compute capability at run time and keeps `attn_prefill_k` for int8 KV.
   With `MOEX_KV=turbo` on RTX 20, prompts fall back to the per-token decode kernel, which is much slower. Use int8 KV on
